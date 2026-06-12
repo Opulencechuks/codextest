@@ -1,0 +1,264 @@
+/**
+ * @bc-forge/sdk — Utility functions for Soroban transaction building and submission.
+ */
+
+import {
+  SorobanRpc,
+  TransactionBuilder,
+  Networks,
+  xdr,
+  Account,
+  Address,
+  nativeToScVal,
+  scValToNative as sdkScValToNative,
+  Contract,
+  Keypair,
+} from '@stellar/stellar-sdk';
+
+import { SimulationError, TransactionError, ValidationError } from './errors';
+
+/**
+ * Builds an `invokeHostFunction` transaction for a Soroban contract call.
+ *
+ * @param rpcUrl           - The Soroban RPC endpoint URL.
+ * @param networkPassphrase - The Stellar network passphrase.
+ * @param contractId       - The deployed contract ID (C... address).
+ * @param method           - The contract function name to invoke.
+ * @param args             - Array of xdr.ScVal arguments.
+ * @param sourceKeypair    - The keypair signing the transaction.
+ * @returns The assembled and signed transaction XDR string.
+ */
+export async function buildInvokeTransaction(
+  rpcUrl: string,
+  networkPassphrase: string,
+  contractId: string,
+  method: string,
+  args: xdr.ScVal[],
+  sourceKeypair: Keypair,
+): Promise<string> {
+  const server = new SorobanRpc.Server(rpcUrl);
+  const sourceAccount = await server.getAccount(sourceKeypair.publicKey());
+
+  const contract = new Contract(contractId);
+
+  const tx = new TransactionBuilder(sourceAccount, {
+    fee: '100',
+    networkPassphrase,
+  })
+    .addOperation(contract.call(method, ...args))
+    .setTimeout(30)
+    .build();
+
+  // Simulate to get the assembled transaction
+  const simulated = await server.simulateTransaction(tx);
+
+  if (SorobanRpc.Api.isSimulationError(simulated)) {
+    throw new SimulationError('Contract simulation failed', simulated.error);
+  }
+
+  const assembled = SorobanRpc.assembleTransaction(tx, simulated).build();
+  assembled.sign(sourceKeypair);
+
+  return assembled.toXDR();
+}
+
+/**
+ * Submits a signed transaction XDR to the Soroban RPC and waits for confirmation.
+ *
+ * @param rpcUrl  - The Soroban RPC endpoint URL.
+ * @param txXdr   - The signed transaction in XDR format.
+ * @returns The transaction result from the ledger.
+ */
+export async function submitTransaction(
+  rpcUrl: string,
+  txXdr: string,
+): Promise<SorobanRpc.Api.GetTransactionResponse> {
+  const server = new SorobanRpc.Server(rpcUrl);
+  const tx = TransactionBuilder.fromXDR(txXdr, Networks.TESTNET);
+
+  const sendResponse = await server.sendTransaction(tx);
+
+  if (sendResponse.status === 'ERROR') {
+    throw new TransactionSubmissionError(
+      `Transaction submission failed: ${sendResponse.errorResult}`,
+    );
+  }
+
+  // Poll for completion
+  let getResponse: SorobanRpc.Api.GetTransactionResponse;
+  let attempts = 0;
+  const maxAttempts = 30;
+
+  do {
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    getResponse = await server.getTransaction(sendResponse.hash);
+    attempts++;
+  } while (
+    getResponse.status === SorobanRpc.Api.GetTransactionStatus.NOT_FOUND &&
+    attempts < maxAttempts
+  );
+
+  if (getResponse.status === SorobanRpc.Api.GetTransactionStatus.NOT_FOUND) {
+    throw new TransactionTimeoutError(
+      'Transaction not found after maximum polling attempts',
+      sendResponse.hash,
+    );
+  }
+
+  return getResponse;
+}
+
+/**
+ * Converts a Stellar address string to an ScVal for contract invocation.
+ */
+export function addressToScVal(address: string): xdr.ScVal {
+  return new Address(address).toScVal();
+}
+
+/**
+ * Converts a native i128 bigint to an ScVal.
+ */
+export function i128ToScVal(value: bigint): xdr.ScVal {
+  return nativeToScVal(value, { type: 'i128' });
+}
+
+/**
+ * Converts a native string to an ScVal.
+ */
+export function stringToScVal(value: string): xdr.ScVal {
+  return nativeToScVal(value, { type: 'string' });
+}
+
+/**
+ * Converts a native u32 to an ScVal.
+ */
+export function u32ToScVal(value: number): xdr.ScVal {
+  return nativeToScVal(value, { type: 'u32' });
+}
+
+/**
+ * Converts an ScVal to a native JS type.
+ */
+export function scValToNative(scVal: xdr.ScVal): any {
+  return sdkScValToNative(scVal);
+}
+
+/**
+ * Builds an unsigned transaction XDR for offline signing.
+ *
+ * @param rpcUrl           - The Soroban RPC endpoint URL.
+ * @param networkPassphrase - The Stellar network passphrase.
+ * @param contractId       - The deployed contract ID (C... address).
+ * @param method           - The contract function name to invoke.
+ * @param args             - Array of xdr.ScVal arguments.
+ * @param sourcePublicKey  - The public key of the transaction source account.
+ * @returns The unsigned transaction XDR string (requires signing before submission).
+ */
+export async function buildUnsignedTransaction(
+  rpcUrl: string,
+  networkPassphrase: string,
+  contractId: string,
+  method: string,
+  args: xdr.ScVal[],
+  sourcePublicKey: string,
+): Promise<string> {
+  const server = new SorobanRpc.Server(rpcUrl);
+  const sourceAccount = await server.getAccount(sourcePublicKey);
+
+  const contract = new Contract(contractId);
+
+  const tx = new TransactionBuilder(sourceAccount, {
+    fee: '100',
+    networkPassphrase,
+  })
+    .addOperation(contract.call(method, ...args))
+    .setTimeout(30)
+    .build();
+
+  // Simulate to get the assembled transaction
+  const simulated = await server.simulateTransaction(tx);
+
+  if (SorobanRpc.Api.isSimulationError(simulated)) {
+    // Parse potential Soroban panic message and throw a structured SimulationError
+    const panicMsg = SimulationError.parsePanic(simulated.error);
+    throw new SimulationError('Simulation failed', panicMsg ?? simulated.error, simulated.error);
+  }
+
+  const assembled = SorobanRpc.assembleTransaction(tx, simulated).build();
+
+  // Return unsigned transaction
+  return assembled.toXDR();
+}
+
+/**
+ * Signs a transaction XDR with the provided keypair.
+ *
+ * @param txXdr      - The unsigned transaction in XDR format.
+ * @param networkPassphrase - The Stellar network passphrase.
+ * @param keypair    - The keypair to sign the transaction with.
+ * @returns The signed transaction XDR string.
+ */
+export function signTransaction(
+  txXdr: string,
+  networkPassphrase: string,
+  keypair: Keypair,
+): string {
+  const tx = TransactionBuilder.fromXDR(txXdr, networkPassphrase);
+  tx.sign(keypair);
+  return tx.toXDR();
+}
+
+/**
+ * Simulates a contract invocation without building or submitting a transaction.
+ *
+ * @param rpcUrl           - The Soroban RPC endpoint URL.
+ * @param networkPassphrase - The Stellar network passphrase.
+ * @param contractId       - The deployed contract ID (C... address).
+ * @param method           - The contract function name to invoke.
+ * @param args             - Array of xdr.ScVal arguments.
+ * @param sourcePublicKey  - The public key for simulation context.
+ * @returns The simulation result including return value and cost.
+ */
+export async function simulateTransaction(
+  rpcUrl: string,
+  networkPassphrase: string,
+  contractId: string,
+  method: string,
+  args: xdr.ScVal[],
+  sourcePublicKey: string,
+): Promise<SorobanRpc.Api.SimulateTransactionResponse> {
+  const server = new SorobanRpc.Server(rpcUrl);
+
+  // Create a dummy account for simulation
+  const account = new Account(sourcePublicKey, '0');
+
+  const contract = new Contract(contractId);
+
+  const tx = new TransactionBuilder(account, {
+    fee: '100',
+    networkPassphrase,
+  })
+    .addOperation(contract.call(method, ...args))
+    .setTimeout(30)
+    .build();
+
+  const simulated = await server.simulateTransaction(tx);
+
+  if (SorobanRpc.Api.isSimulationError(simulated)) {
+    const panicMsg = SimulationError.parsePanic(simulated.error);
+    throw new SimulationError('Simulation failed', panicMsg ?? simulated.error, simulated.error);
+  }
+
+  return simulated;
+}
+
+/**
+ * Converts a 32-byte hex string or Buffer to an ScVal.
+ */
+export function hashToScVal(hash: string | Buffer): xdr.ScVal {
+  const buf = typeof hash === 'string' ? Buffer.from(hash, 'hex') : hash;
+  if (buf.length !== 32) {
+    throw new ValidationError('Hash must be exactly 32 bytes');
+  }
+  return xdr.ScVal.scvBytes(buf);
+}
